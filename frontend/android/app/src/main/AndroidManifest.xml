@@ -1,26 +1,22 @@
 <!-- android/app/src/main/AndroidManifest.xml -->
 <manifest xmlns:android="http://schemas.android.com/apk/res/android"
-    xmlns:tools="http://schemas.android.com/tools"
-    package="com.example.run_weight_coach">
+    xmlns:tools="http://schemas.android.com/tools">
 
     <uses-permission android:name="android.permission.INTERNET" />
     <uses-permission android:name="android.permission.RECEIVE_BOOT_COMPLETED" />
-    <!-- Android 13+ runtime permission for posting notifications -->
-    <uses-permission
-        android:name="android.permission.POST_NOTIFICATIONS"
-        tools:targetApi="33" />
+    <uses-permission android:name="android.permission.POST_NOTIFICATIONS" tools:targetApi="33" />
 
     <application
         android:label="MiniFitna"
+        android:name="${applicationName}"
         android:icon="@mipmap/ic_launcher">
 
-        <!-- Explicitly mark Flutter embedding v2 -->
         <meta-data
             android:name="flutterEmbedding"
             android:value="2" />
 
         <activity
-            android:name=".MainActivity"
+            android:name="com.ermine.minifitna.MainActivity"
             android:exported="true"
             android:launchMode="singleTop"
             android:theme="@style/LaunchTheme"
@@ -34,7 +30,6 @@
             </intent-filter>
         </activity>
 
-        <!-- Boot receiver so scheduled notifications survive reboots/app updates -->
         <receiver
             android:name="com.dexterous.flutterlocalnotifications.ScheduledNotificationBootReceiver"
             android:enabled="true"
@@ -44,6 +39,5 @@
                 <action android:name="android.intent.action.MY_PACKAGE_REPLACED" />
             </intent-filter>
         </receiver>
-
     </application>
 </manifest>

@@ -1571,8 +1571,15 @@ class NotificationService {
   Future<void> cancel(int id) async {
     logging.debug("NotificationService.cancel(id=$id)");
     if (!_enabled) return;
-    await _fln.cancel(id);
+    try {
+      await _fln.cancel(id);
+    } catch (e) {
+      // Some devices/builds can throw when the plugin deserializes its cache.
+      // Swallow to keep UX smooth; we re-schedule right after anyway.
+      logging.debug("NotificationService.cancel(): ignored error -> $e");
+    }
   }
+
 
   Future<void> rescheduleBoth(String weighTime, String runTime) async {
     logging.debug("NotificationService.rescheduleBoth(weighTime=$weighTime, runTime=$runTime)");
