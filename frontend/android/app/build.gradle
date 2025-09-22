@@ -4,7 +4,7 @@ plugins {
     id "dev.flutter.flutter-gradle-plugin"
 }
 
-// Fallbacks if you don't pass --build-number/--build-name
+// Fallbacks for versioning (used if you don't pass --build-number/--build-name)
 def flutterVersionCode = project.hasProperty('flutterVersionCode') ? project.flutterVersionCode : '1'
 def flutterVersionName = project.hasProperty('flutterVersionName') ? project.flutterVersionName : '1.0'
 
@@ -21,33 +21,40 @@ android {
         versionName flutterVersionName
     }
 
-    // Keep Java/Kotlin targets aligned (fixes the 1.8 vs 17 mismatch)
+    // ✅ Java/Kotlin toolchains
     compileOptions {
+        // Enable core library desugaring for java.time, streams, etc.
+        coreLibraryDesugaringEnabled true
+
+        // Target Java 17 bytecode
         sourceCompatibility JavaVersion.VERSION_17
         targetCompatibility JavaVersion.VERSION_17
     }
+
     kotlinOptions {
         jvmTarget = '17'
-    }
-    // Also set toolchain to 17
-    // (works with AGP 8+; harmless otherwise)
-    kotlin {
-        jvmToolchain(17)
     }
 
     buildTypes {
         release {
-            // IMPORTANT: avoid stripping Gson generic metadata that the plugin needs
-            minifyEnabled false
-            shrinkResources false
-
-            // (Switch to your real release keystore when ready)
+            // TODO: replace with your real release signing config
             signingConfig signingConfigs.debug
 
-            // If/when you enable minify, also add:
-            // proguardFiles getDefaultProguardFile('proguard-android-optimize.txt'), 'proguard-rules.pro'
+            // ✅ Enable shrinking/obfuscation and use our ProGuard rules so Gson keeps type info
+            minifyEnabled true
+            shrinkResources true
+            proguardFiles getDefaultProguardFile('proguard-android-optimize.txt'), 'proguard-rules.pro'
+        }
+        debug {
+            // keep debug builds simple
+            minifyEnabled false
+            shrinkResources false
         }
     }
+}
+
+kotlin {
+    jvmToolchain(17)
 }
 
 flutter {
@@ -55,5 +62,9 @@ flutter {
 }
 
 dependencies {
+    // Kotlin stdlib (compatible with AGP/Kotlin versions pinned in settings.gradle)
     implementation "org.jetbrains.kotlin:kotlin-stdlib-jdk8"
+
+    // ✅ Core library desugaring dependency required by flutter_local_notifications
+    coreLibraryDesugaring "com.android.tools:desugar_jdk_libs:2.0.4"
 }

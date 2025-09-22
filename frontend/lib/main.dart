@@ -1,4 +1,3 @@
-// lib/main.dart
 import 'dart:async';
 import 'dart:convert';
 import 'dart:math' as math;
@@ -8,6 +7,7 @@ import 'package:http/http.dart' as http;
 import 'package:intl/intl.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 import 'package:flutter_local_notifications/flutter_local_notifications.dart';
+import 'package:flutter/services.dart' show PlatformException;
 import 'package:timezone/data/latest.dart' as tzdata;
 import 'package:timezone/timezone.dart' as tz;
 import 'package:fl_chart/fl_chart.dart';
@@ -80,6 +80,12 @@ class ApiService {
     logging.debug("ApiService.saveToken() done");
   }
 
+  Future<void> clearToken() async {
+    final sp = await SharedPreferences.getInstance();
+    await sp.remove("jwt");
+    _jwt = null;
+  }
+
   Map<String, String> _headers({bool json = false}) {
     final h = <String, String>{"Accept": "application/json"};
     if (json) h["Content-Type"] = "application/json"; // don’t set for GET to avoid preflight
@@ -121,6 +127,34 @@ class ApiService {
     logging.debug("POST $url status=${r.statusCode} body=${_preview(r.body)}");
     if (r.statusCode >= 400) {
       throw Exception("Login failed: ${r.body}");
+    }
+    return jsonDecode(r.body) as Map<String, dynamic>;
+  }
+
+  Future<Map<String, dynamic>> forgotPassword(String username) async {
+    final url = "$_base/api/password/forgot";
+    final body = {"username": username};
+    logging.debug("POST $url body=$body");
+    final r = await _client
+        .post(Uri.parse(url), headers: _headers(json: true), body: jsonEncode(body))
+        .timeout(_timeout);
+    logging.debug("POST $url status=${r.statusCode} body=${_preview(r.body)}");
+    if (r.statusCode >= 400) {
+      throw Exception("Forgot password failed: ${r.body}");
+    }
+    return jsonDecode(r.body) as Map<String, dynamic>;
+  }
+
+  Future<Map<String, dynamic>> resetPassword(String username, String otp, String newPassword) async {
+    final url = "$_base/api/password/reset";
+    final body = {"username": username, "otp": otp, "new_password": newPassword};
+    logging.debug("POST $url body=$body");
+    final r = await _client
+        .post(Uri.parse(url), headers: _headers(json: true), body: jsonEncode(body))
+        .timeout(_timeout);
+    logging.debug("POST $url status=${r.statusCode} body=${_preview(r.body)}");
+    if (r.statusCode >= 400) {
+      throw Exception("Reset password failed: ${r.body}");
     }
     return jsonDecode(r.body) as Map<String, dynamic>;
   }
@@ -213,7 +247,7 @@ class ApiService {
 
   String _preview(String body) {
     if (body.length <= 300) return body;
-    return body.substring(0, 300) + "...(truncated)";
+    return "${body.substring(0, 300)}...(truncated)";
   }
 }
 
@@ -386,6 +420,14 @@ class AuthScreen extends StatefulWidget {
 class _AuthScreenState extends State<AuthScreen> {
   final _userC = TextEditingController();
   final _passC = TextEditingController();
+
+  // Forgot password state
+  bool _forgotMode = false;
+  final _forgotUserC = TextEditingController();
+  final _otpC = TextEditingController();
+  final _newPassC = TextEditingController();
+  String? _otpHint; // For demo, shows the OTP returned by backend
+
   bool _busy = false;
   String? _err;
 
@@ -429,6 +471,82 @@ class _AuthScreenState extends State<AuthScreen> {
     }
   }
 
+  Future<void> _startForgot() async {
+    setState(() {
+      _busy = true;
+      _err = null;
+      _otpHint = null;
+    });
+    final user = _forgotUserC.text.trim();
+    logging.debug("AuthScreen._startForgot() user=$user");
+    if (user.isEmpty) {
+      setState(() {
+        _busy = false;
+        _err = "Please enter your username.";
+      });
+      return;
+    }
+    try {
+      final res = await ApiService.instance.forgotPassword(user);
+      // In production, you would NOT show the OTP; you'd send it by email/SMS.
+      _otpHint = res["otp"]?.toString();
+      logging.debug("AuthScreen._startForgot() res=$res");
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text("OTP sent (demo: shown on screen)")));
+      }
+    } catch (e) {
+      logging.debug("AuthScreen._startForgot() error=$e");
+      setState(() {
+        _err = e.toString();
+      });
+    } finally {
+      setState(() {
+        _busy = false;
+      });
+    }
+  }
+
+  Future<void> _finishReset() async {
+    setState(() {
+      _busy = true;
+      _err = null;
+    });
+    final user = _forgotUserC.text.trim();
+    final otp = _otpC.text.trim();
+    final newPass = _newPassC.text;
+    logging.debug("AuthScreen._finishReset() user=$user otp=$otp");
+    if (user.isEmpty || otp.isEmpty || newPass.isEmpty) {
+      setState(() {
+        _busy = false;
+        _err = "Fill username, OTP, and new password.";
+      });
+      return;
+    }
+    try {
+      final res = await ApiService.instance.resetPassword(user, otp, newPass);
+      logging.debug("AuthScreen._finishReset() res=$res");
+      final token = res["token"] as String?;
+      if (token == null) {
+        throw Exception("No token returned");
+      }
+      await ApiService.instance.saveToken(token);
+      final me = await ApiService.instance.meGet();
+      await NotificationService.instance.rescheduleBoth(me["weigh_time"], me["run_time"]);
+      if (mounted) {
+        Navigator.of(context).pushReplacement(MaterialPageRoute(builder: (_) => const Home()));
+      }
+    } catch (e) {
+      logging.debug("AuthScreen._finishReset() error=$e");
+      setState(() {
+        _err = e.toString();
+      });
+    } finally {
+      setState(() {
+        _busy = false;
+      });
+    }
+  }
+
   @override
   Widget build(BuildContext context) {
     logging.debug("AuthScreen.build()");
@@ -442,32 +560,135 @@ class _AuthScreenState extends State<AuthScreen> {
             margin: const EdgeInsets.all(24),
             child: Padding(
               padding: const EdgeInsets.all(20),
-              child: Column(mainAxisSize: MainAxisSize.min, children: [
-                const SizedBox(height: 8),
-                Text("Sign in or Register", style: Theme.of(context).textTheme.headlineSmall),
-                const SizedBox(height: 8),
-                TextField(controller: _userC, decoration: const InputDecoration(prefixIcon: Icon(Icons.person), labelText: "Username")),
-                const SizedBox(height: 8),
-                TextField(controller: _passC, obscureText: true, decoration: const InputDecoration(prefixIcon: Icon(Icons.lock), labelText: "Password")),
-                const SizedBox(height: 12),
-                if (_err != null) Text(_err!, style: TextStyle(color: Theme.of(context).colorScheme.error)),
-                const SizedBox(height: 8),
-                Row(children: [
-                  Expanded(
-                    child: FilledButton(
-                      onPressed: _busy ? null : () => _do(false),
-                      child: _busy ? const SizedBox(height: 18, width: 18, child: CircularProgressIndicator(strokeWidth: 2)) : const Text("Login"),
+              child: AnimatedSize(
+                duration: const Duration(milliseconds: 200),
+                child: Column(mainAxisSize: MainAxisSize.min, children: [
+                  const SizedBox(height: 8),
+                  Text(_forgotMode ? "Forgot Password" : "Sign in or Register",
+                      style: Theme.of(context).textTheme.headlineSmall),
+                  const SizedBox(height: 8),
+                  if (!_forgotMode) ...[
+                    TextField(
+                        controller: _userC,
+                        decoration: const InputDecoration(prefixIcon: Icon(Icons.person), labelText: "Username")),
+                    const SizedBox(height: 8),
+                    TextField(
+                        controller: _passC,
+                        obscureText: true,
+                        decoration: const InputDecoration(prefixIcon: Icon(Icons.lock), labelText: "Password")),
+                    const SizedBox(height: 12),
+                    if (_err != null) Text(_err!, style: TextStyle(color: Theme.of(context).colorScheme.error)),
+                    const SizedBox(height: 8),
+                    Row(children: [
+                      Expanded(
+                        child: FilledButton(
+                          onPressed: _busy ? null : () => _do(false),
+                          child: _busy
+                              ? const SizedBox(height: 18, width: 18, child: CircularProgressIndicator(strokeWidth: 2))
+                              : const Text("Login"),
+                        ),
+                      ),
+                      const SizedBox(width: 12),
+                      Expanded(
+                        child: OutlinedButton(
+                          onPressed: _busy ? null : () => _do(true),
+                          child: const Text("Register"),
+                        ),
+                      ),
+                    ]),
+                    const SizedBox(height: 8),
+                    Align(
+                      alignment: Alignment.centerRight,
+                      child: TextButton(
+                        onPressed: _busy
+                            ? null
+                            : () {
+                                setState(() {
+                                  _forgotMode = true;
+                                  _err = null;
+                                  _otpHint = null;
+                                  _forgotUserC.text = _userC.text.trim();
+                                });
+                              },
+                        child: const Text("Forgot password?"),
+                      ),
                     ),
-                  ),
-                  const SizedBox(width: 12),
-                  Expanded(
-                    child: OutlinedButton(
-                      onPressed: _busy ? null : () => _do(true),
-                      child: const Text("Register"),
+                  ] else ...[
+                    TextField(
+                      controller: _forgotUserC,
+                      decoration: const InputDecoration(prefixIcon: Icon(Icons.person), labelText: "Username"),
                     ),
-                  ),
+                    const SizedBox(height: 8),
+                    Row(
+                      children: [
+                        Expanded(
+                          child: FilledButton.icon(
+                            onPressed: _busy ? null : _startForgot,
+                            icon: const Icon(Icons.sms),
+                            label: _busy ? const Text("Sending…") : const Text("Send OTP"),
+                          ),
+                        ),
+                      ],
+                    ),
+                    if (_otpHint != null) ...[
+                      const SizedBox(height: 8),
+                      // For demo: show OTP. Remove in production.
+                      Row(
+                        children: [
+                          const Icon(Icons.info_outline, size: 18),
+                          const SizedBox(width: 6),
+                          Flexible(child: Text("Demo OTP: $_otpHint (valid ~10 min)")),
+                        ],
+                      ),
+                    ],
+                    const SizedBox(height: 8),
+                    TextField(
+                      controller: _otpC,
+                      keyboardType: TextInputType.number,
+                      decoration: const InputDecoration(prefixIcon: Icon(Icons.verified), labelText: "Enter OTP"),
+                    ),
+                    const SizedBox(height: 8),
+                    TextField(
+                      controller: _newPassC,
+                      obscureText: true,
+                      decoration:
+                          const InputDecoration(prefixIcon: Icon(Icons.lock_reset), labelText: "New password (min 6)"),
+                    ),
+                    const SizedBox(height: 12),
+                    if (_err != null) Text(_err!, style: TextStyle(color: Theme.of(context).colorScheme.error)),
+                    const SizedBox(height: 8),
+                    Row(
+                      children: [
+                        Expanded(
+                          child: FilledButton.icon(
+                            onPressed: _busy ? null : _finishReset,
+                            icon: const Icon(Icons.check),
+                            label: _busy ? const Text("Resetting…") : const Text("Reset password"),
+                          ),
+                        ),
+                        const SizedBox(width: 12),
+                        Expanded(
+                          child: OutlinedButton.icon(
+                            onPressed: _busy
+                                ? null
+                                : () {
+                                    setState(() {
+                                      _forgotMode = false;
+                                      _err = null;
+                                      _otpHint = null;
+                                      _otpC.clear();
+                                      _newPassC.clear();
+                                    });
+                                  },
+                            icon: const Icon(Icons.arrow_back),
+                            label: const Text("Back to login"),
+                          ),
+                        ),
+                      ],
+                    ),
+                  ],
                 ]),
-              ]),
+              ),
             ),
           ),
         ),
@@ -567,7 +788,6 @@ class _Dashboard extends StatelessWidget {
       child: ListView(
         padding: const EdgeInsets.all(16),
         children: [
-          // Weights & Prediction section (now persists goal date)
           const WeightsSection(),
           const SizedBox(height: 16),
 
@@ -685,7 +905,7 @@ class _WeightsSectionState extends State<WeightsSection> {
   void initState() {
     super.initState();
     logging.debug("WeightsSection.initState()");
-    _loadSavedGoalDate(); // NEW: restore persisted goal date
+    _loadSavedGoalDate();
     _load();
   }
 
@@ -736,7 +956,6 @@ class _WeightsSectionState extends State<WeightsSection> {
         return;
       }
 
-      // Parse & sort ascending by day
       final parsed = <Map<String, dynamic>>[];
       for (final w in weights) {
         parsed.add({
@@ -760,7 +979,6 @@ class _WeightsSectionState extends State<WeightsSection> {
       final reg = _linearRegression(pts);
       logging.debug("WeightsSection._load() regression slope_per_day=${reg?.m} intercept=${reg?.b} base=$base latest=$latest");
 
-      // If targetWeight initial empty: default to current target (if available) or latest
       if (_targetWeightC.text.isEmpty) {
         try {
           final me = await ApiService.instance.meGet();
@@ -822,15 +1040,67 @@ class _WeightsSectionState extends State<WeightsSection> {
     final slope = _slopePerDay ?? 0.0;
     logging.debug("goalFeasible: latest=$_latestWeight target=$targetWeight days=$days requiredDaily=$requiredDaily slope=$slope");
 
-    // Direction must align
     if (requiredDaily == 0 && slope.abs() < 0.01) return true;
     if (requiredDaily.sign != slope.sign && slope.abs() > 0.01) return false;
 
-    // If our current magnitude is sufficient (allow 20% cushion), it's green.
     if (slope.abs() >= (requiredDaily.abs() * 0.8)) return true;
 
-    // Otherwise red.
     return false;
+  }
+
+  Widget _buildPredictionResult(ThemeData theme) {
+    final twText = _targetWeightC.text.trim();
+    if (twText.isEmpty || double.tryParse(twText.replaceAll(',', '.')) == null) {
+      return Text(
+        "Enter a valid target weight to evaluate feasibility.",
+        style: theme.textTheme.bodyMedium,
+      );
+    }
+
+    final targetWeight = double.parse(twText.replaceAll(',', '.'));
+    final predicted = _predictOn(_targetDate);
+    if (predicted == null) {
+      return Text(
+        "Not enough data to build a prediction yet.",
+        style: theme.textTheme.bodyMedium,
+      );
+    }
+
+    final feasible = _goalFeasible(targetWeight, _targetDate);
+    final ok = feasible == true;
+    final color = ok ? Colors.green : Colors.red;
+    final msg = ok
+        ? "Likely feasible by ${DateFormat('MMM d, yyyy').format(_targetDate)}"
+        : "Unlikely without stronger change by ${DateFormat('MMM d, yyyy').format(_targetDate)}";
+
+    logging.debug(
+        "Prediction: target=$targetWeight predicted_on_date=${predicted.toStringAsFixed(1)} feasible=$feasible");
+
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
+        Wrap(
+          spacing: 12,
+          crossAxisAlignment: WrapCrossAlignment.center,
+          children: [
+            Chip(
+              label: Text(ok ? "FEASIBLE" : "NOT FEASIBLE"),
+              backgroundColor: color.withOpacity(0.15),
+              side: BorderSide(color: color),
+              labelStyle: theme.textTheme.bodyMedium?.copyWith(
+                color: ok ? Colors.green[900] : Colors.red[900],
+                fontWeight: FontWeight.w600,
+              ),
+            ),
+            Text(
+              "Predicted: ${predicted.toStringAsFixed(1)} kg on ${DateFormat('MMM d').format(_targetDate)}",
+            ),
+          ],
+        ),
+        const SizedBox(height: 6),
+        Text(msg, style: theme.textTheme.bodyMedium),
+      ],
+    );
   }
 
   @override
@@ -867,8 +1137,7 @@ class _WeightsSectionState extends State<WeightsSection> {
     final viewMinY = (minY - yPadding * 0.5);
     final viewMaxY = (maxY + yPadding * 0.5);
 
-    // Build predicted future line for next 30 days
-    final futureDays = 30;
+    const futureDays = 30;
     final lastX = _points.last.x;
     final predLine = <FlSpot>[];
     if (_slopePerDay != null && _intercept != null) {
@@ -879,10 +1148,9 @@ class _WeightsSectionState extends State<WeightsSection> {
       }
     }
 
-    // Real data line
     final realLine = _points.map((p) => FlSpot(p.x, p.y)).toList();
 
-    String _fmtDateTick(double x) {
+    String fmtDateTick(double x) {
       final d = base.add(Duration(days: x.round()));
       return DateFormat('MM/dd').format(d);
     }
@@ -921,7 +1189,7 @@ class _WeightsSectionState extends State<WeightsSection> {
                           sideTitles: SideTitles(
                             showTitles: true,
                             reservedSize: 44,
-                            getTitlesWidget: (v, m) => Text("${v.toStringAsFixed(0)}", style: theme.textTheme.bodySmall),
+                            getTitlesWidget: (v, m) => Text(v.toStringAsFixed(0), style: theme.textTheme.bodySmall),
                             interval: ((viewMaxY - viewMinY) / 4).clamp(1, 10).toDouble(),
                           ),
                         ),
@@ -931,7 +1199,7 @@ class _WeightsSectionState extends State<WeightsSection> {
                             reservedSize: 28,
                             getTitlesWidget: (v, m) => Padding(
                               padding: const EdgeInsets.only(top: 4),
-                              child: Text(_fmtDateTick(v), style: theme.textTheme.bodySmall),
+                              child: Text(fmtDateTick(v), style: theme.textTheme.bodySmall),
                             ),
                             interval: (_points.length / 5).clamp(1, 7).toDouble(),
                           ),
@@ -972,8 +1240,6 @@ class _WeightsSectionState extends State<WeightsSection> {
             ),
           ),
         ),
-
-        // Goal predictor card (persists goal date)
         Card(
           child: Padding(
             padding: const EdgeInsets.all(16),
@@ -1010,7 +1276,7 @@ class _WeightsSectionState extends State<WeightsSection> {
                           if (picked != null) {
                             logging.debug("WeightsSection.pickTargetDate() picked=$picked");
                             setState(() => _targetDate = picked);
-                            await _saveGoalDate(); // NEW: persist selection
+                            await _saveGoalDate();
                           } else {
                             logging.debug("WeightsSection.pickTargetDate() cancelled");
                           }
@@ -1025,48 +1291,6 @@ class _WeightsSectionState extends State<WeightsSection> {
             ]),
           ),
         ),
-      ],
-    );
-  }
-
-  Widget _buildPredictionResult(ThemeData theme) {
-    final twText = _targetWeightC.text.trim();
-    if (twText.isEmpty || double.tryParse(twText.replaceAll(',', '.')) == null) {
-      return Text("Enter a valid target weight to evaluate feasibility.", style: theme.textTheme.bodyMedium);
-    }
-    final targetWeight = double.parse(twText.replaceAll(',', '.'));
-    final predicted = _predictOn(_targetDate);
-    if (predicted == null) {
-      return Text("Not enough data to build a prediction yet.", style: theme.textTheme.bodyMedium);
-    }
-
-    final feasible = _goalFeasible(targetWeight, _targetDate);
-    final ok = feasible == true;
-    final color = ok ? Colors.green : Colors.red;
-    final msg = ok
-        ? "Likely feasible by ${DateFormat('MMM d, yyyy').format(_targetDate)}"
-        : "Unlikely without stronger change by ${DateFormat('MMM d, yyyy').format(_targetDate)}";
-
-    logging.debug("Prediction: target=$targetWeight predicted_on_date=${predicted.toStringAsFixed(1)} feasible=$feasible");
-
-    return Column(
-      crossAxisAlignment: CrossAxisAlignment.start,
-      children: [
-        Wrap(
-          spacing: 12,
-          crossAxisAlignment: WrapCrossAlignment.center,
-          children: [
-            Chip(
-              label: Text(ok ? "FEASIBLE" : "NOT FEASIBLE"),
-              backgroundColor: color.withOpacity(0.15),
-              side: BorderSide(color: color),
-              labelStyle: theme.textTheme.bodyMedium?.copyWith(color: ok ? Colors.green[900] : Colors.red[900], fontWeight: FontWeight.w600),
-            ),
-            Text("Predicted: ${predicted.toStringAsFixed(1)} kg on ${DateFormat('MMM d').format(_targetDate)}"),
-          ],
-        ),
-        const SizedBox(height: 6),
-        Text(msg, style: theme.textTheme.bodyMedium),
       ],
     );
   }
@@ -1334,6 +1558,11 @@ class _SettingsScreenState extends State<SettingsScreen> {
   bool _loading = true;
   String? _err;
 
+  // Diagnostics state
+  bool _testingNow = false;
+  bool _testingScheduled = false;
+  String? _testErr;
+
   @override
   void initState() {
     super.initState();
@@ -1432,6 +1661,40 @@ class _SettingsScreenState extends State<SettingsScreen> {
     }
   }
 
+  Future<void> _sendTestNow() async {
+    setState(() {
+      _testingNow = true;
+      _testErr = null;
+    });
+    try {
+      await NotificationService.instance.showTestNow();
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text("Test notification sent")));
+      }
+    } catch (e) {
+      setState(() => _testErr = e.toString());
+    } finally {
+      setState(() => _testingNow = false);
+    }
+  }
+
+  Future<void> _scheduleTest() async {
+    setState(() {
+      _testingScheduled = true;
+      _testErr = null;
+    });
+    try {
+      await NotificationService.instance.scheduleTestInSeconds(10);
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text("Scheduled test in 10 seconds")));
+      }
+    } catch (e) {
+      setState(() => _testErr = e.toString());
+    } finally {
+      setState(() => _testingScheduled = false);
+    }
+  }
+
   @override
   Widget build(BuildContext context) {
     logging.debug("Settings.build() loading=$_loading err_present=${_err != null}");
@@ -1500,6 +1763,37 @@ class _SettingsScreenState extends State<SettingsScreen> {
             ]),
           ),
         ),
+        const SizedBox(height: 12),
+        Card(
+          child: Padding(
+            padding: const EdgeInsets.all(16),
+            child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+              Text("Diagnostics", style: Theme.of(context).textTheme.titleLarge),
+              const SizedBox(height: 8),
+              Row(children: [
+                Expanded(
+                  child: FilledButton.icon(
+                    onPressed: _testingNow ? null : _sendTestNow,
+                    icon: const Icon(Icons.notifications_active),
+                    label: _testingNow ? const Text("Sending…") : const Text("Send test now"),
+                  ),
+                ),
+                const SizedBox(width: 12),
+                Expanded(
+                  child: OutlinedButton.icon(
+                    onPressed: _testingScheduled ? null : _scheduleTest,
+                    icon: const Icon(Icons.schedule_send),
+                    label: _testingScheduled ? const Text("Scheduling…") : const Text("Schedule test in 10s"),
+                  ),
+                ),
+              ]),
+              if (_testErr != null) ...[
+                const SizedBox(height: 8),
+                Text(_testErr!, style: TextStyle(color: Theme.of(context).colorScheme.error)),
+              ]
+            ]),
+          ),
+        ),
       ],
     );
   }
@@ -1519,15 +1813,97 @@ class NotificationService {
       logging.debug("NotificationService.init(): web -> disabled");
       return;
     }
+
     const androidInit = AndroidInitializationSettings('@mipmap/ic_launcher');
     const iosInit = DarwinInitializationSettings();
     const initSettings = InitializationSettings(android: androidInit, iOS: iosInit);
     await _fln.initialize(initSettings);
     _enabled = true;
+
+    // Android 13+ runtime notifications permission
     await _fln
         .resolvePlatformSpecificImplementation<AndroidFlutterLocalNotificationsPlugin>()
         ?.requestNotificationsPermission();
+
+    // Android 12+ “exact alarms” permission (best-effort; may be denied)
+    await _fln
+        .resolvePlatformSpecificImplementation<AndroidFlutterLocalNotificationsPlugin>()
+        ?.requestExactAlarmsPermission();
+
+    // iOS permissions (alerts while app in foreground need this too)
+    await _fln
+        .resolvePlatformSpecificImplementation<IOSFlutterLocalNotificationsPlugin>()
+        ?.requestPermissions(alert: true, badge: true, sound: true);
+
     logging.debug("NotificationService.init(): initialized, enabled=$_enabled");
+  }
+
+  NotificationDetails _defaultDetails({bool foregroundAlert = false}) {
+    return const NotificationDetails(
+      android: AndroidNotificationDetails(
+        'daily_channel_id',
+        'Daily Reminders',
+        channelDescription: 'Daily reminders for weighing and running',
+        importance: Importance.max,
+        priority: Priority.high,
+      ),
+      iOS: DarwinNotificationDetails(
+        presentAlert: true,
+        presentBadge: true,
+        presentSound: true,
+      ),
+    );
+  }
+
+  Future<void> showTestNow() async {
+    logging.debug("NotificationService.showTestNow()");
+    if (!_enabled) {
+      logging.debug("NotificationService.showTestNow(): not enabled, skipping");
+      return;
+    }
+    await _fln.show(
+      999,
+      "Test notification",
+      "If you can see this, notifications are working.",
+      _defaultDetails(foregroundAlert: true),
+      payload: "test_now",
+    );
+    logging.debug("NotificationService.showTestNow(): shown");
+  }
+
+  Future<void> scheduleTestInSeconds(int seconds) async {
+    logging.debug("NotificationService.scheduleTestInSeconds($seconds)");
+    if (!_enabled) {
+      logging.debug("NotificationService.scheduleTestInSeconds(): not enabled, skipping");
+      return;
+    }
+    final when = tz.TZDateTime.now(tz.local).add(Duration(seconds: seconds));
+    try {
+      await _fln.zonedSchedule(
+        998,
+        "Scheduled test",
+        "This arrived ~${seconds}s after you tapped.",
+        when,
+        _defaultDetails(),
+        androidScheduleMode: AndroidScheduleMode.exactAllowWhileIdle,
+        uiLocalNotificationDateInterpretation: UILocalNotificationDateInterpretation.absoluteTime,
+        payload: "test_scheduled_exact",
+      );
+      logging.debug("NotificationService.scheduleTestInSeconds(): scheduled EXACT");
+    } on PlatformException catch (e) {
+      logging.debug("NotificationService.scheduleTestInSeconds(): exact failed -> $e; falling back to INEXACT");
+      await _fln.zonedSchedule(
+        998,
+        "Scheduled test",
+        "This is an inexact scheduled test.",
+        when,
+        _defaultDetails(),
+        androidScheduleMode: AndroidScheduleMode.inexactAllowWhileIdle,
+        uiLocalNotificationDateInterpretation: UILocalNotificationDateInterpretation.absoluteTime,
+        payload: "test_scheduled_inexact",
+      );
+      logging.debug("NotificationService.scheduleTestInSeconds(): scheduled INEXACT");
+    }
   }
 
   Future<void> scheduleDaily({
@@ -1546,26 +1922,33 @@ class NotificationService {
     if (scheduled.isBefore(now)) {
       scheduled = scheduled.add(const Duration(days: 1));
     }
-    await _fln.zonedSchedule(
-      id,
-      title,
-      body,
-      scheduled,
-      const NotificationDetails(
-        android: AndroidNotificationDetails(
-          'daily_channel_id',
-          'Daily Reminders',
-          channelDescription: 'Daily reminders for weighing and running',
-          importance: Importance.max,
-          priority: Priority.high,
-        ),
-        iOS: DarwinNotificationDetails(),
-      ),
-      androidScheduleMode: AndroidScheduleMode.exactAllowWhileIdle,
-      uiLocalNotificationDateInterpretation: UILocalNotificationDateInterpretation.absoluteTime,
-      matchDateTimeComponents: DateTimeComponents.time,
-    );
-    logging.debug("NotificationService.scheduleDaily(): scheduled");
+
+    try {
+      await _fln.zonedSchedule(
+        id,
+        title,
+        body,
+        scheduled,
+        _defaultDetails(),
+        androidScheduleMode: AndroidScheduleMode.exactAllowWhileIdle,
+        uiLocalNotificationDateInterpretation: UILocalNotificationDateInterpretation.absoluteTime,
+        matchDateTimeComponents: DateTimeComponents.time,
+      );
+      logging.debug("NotificationService.scheduleDaily(): scheduled with EXACT");
+    } on PlatformException catch (e) {
+      logging.debug("NotificationService.scheduleDaily(): exact failed -> $e; falling back to INEXACT");
+      await _fln.zonedSchedule(
+        id,
+        title,
+        body,
+        scheduled,
+        _defaultDetails(),
+        androidScheduleMode: AndroidScheduleMode.inexactAllowWhileIdle,
+        uiLocalNotificationDateInterpretation: UILocalNotificationDateInterpretation.absoluteTime,
+        matchDateTimeComponents: DateTimeComponents.time,
+      );
+      logging.debug("NotificationService.scheduleDaily(): scheduled with INEXACT");
+    }
   }
 
   Future<void> cancel(int id) async {
@@ -1574,12 +1957,9 @@ class NotificationService {
     try {
       await _fln.cancel(id);
     } catch (e) {
-      // Some devices/builds can throw when the plugin deserializes its cache.
-      // Swallow to keep UX smooth; we re-schedule right after anyway.
       logging.debug("NotificationService.cancel(): ignored error -> $e");
     }
   }
-
 
   Future<void> rescheduleBoth(String weighTime, String runTime) async {
     logging.debug("NotificationService.rescheduleBoth(weighTime=$weighTime, runTime=$runTime)");

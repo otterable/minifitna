@@ -1,4 +1,3 @@
-# app.py
 import os
 import sqlite3
 import hashlib
@@ -9,6 +8,8 @@ import logging
 import threading
 from datetime import datetime, timedelta, date
 from functools import wraps
+import secrets
+import re
 
 from flask import Flask, request, jsonify, g, make_response
 from werkzeug.middleware.proxy_fix import ProxyFix
@@ -22,6 +23,7 @@ logging.debug("Starting app module import")
 SECRET_KEY = os.environ.get("APP_SECRET", "change_this_to_a_long_random_secret")
 JWT_ALG = "HS256"
 DB_PATH = os.environ.get("APP_DB", "minifitna.db")
+OTP_TTL_SECONDS = int(os.environ.get("OTP_TTL_SECONDS", "600"))  # 10 minutes
 logging.debug(f"Config loaded: DB_PATH={DB_PATH}, JWT_ALG={JWT_ALG}, SECRET_KEY_set={bool(SECRET_KEY)}")
 
 # ==== App ====
@@ -96,6 +98,19 @@ def init_db():
             UNIQUE(user_id, day),
             FOREIGN KEY(user_id) REFERENCES users(id) ON DELETE CASCADE
         );
+
+        CREATE TABLE IF NOT EXISTS reset_otps(
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER NOT NULL,
+            code_hash TEXT NOT NULL,
+            expires_at TEXT NOT NULL,
+            consumed INTEGER NOT NULL DEFAULT 0,
+            attempts_left INTEGER NOT NULL DEFAULT 5,
+            created_at TEXT NOT NULL DEFAULT (datetime('now')),
+            FOREIGN KEY(user_id) REFERENCES users(id) ON DELETE CASCADE
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_reset_otps_user_id ON reset_otps(user_id);
         """
     )
     db.commit()
@@ -187,6 +202,13 @@ def _verify_password(password: str, password_hash: str) -> bool:
     logging.debug("Verifying password via compare_digest")
     return hmac.compare_digest(_hash_password(password), password_hash)
 
+def _normalize_username(u: str) -> str:
+    return (u or "").strip().lower()
+
+def _otp_hash(code: str) -> str:
+    # HMAC with SECRET_KEY to avoid storing OTP in plaintext
+    return hmac.new(SECRET_KEY.encode("utf-8"), code.encode("utf-8"), hashlib.sha256).hexdigest()
+
 def create_token(user_id: int, username: str) -> str:
     logging.debug(f"Creating JWT for user_id={user_id}, username={username}")
     payload = {
@@ -229,12 +251,18 @@ def row_to_dict(row: sqlite3.Row) -> dict:
     logging.debug(f"row_to_dict -> {d}")
     return d
 
+def _generate_otp() -> str:
+    # 6-digit numeric OTP, zero-padded
+    code = f"{secrets.randbelow(1_000_000):06d}"
+    logging.debug(f"_generate_otp() -> {code}")
+    return code
+
 # ==== Auth ====
 @app.route("/api/register", methods=["POST"])
 def register():
     logging.debug("Register endpoint called")
     data = request.get_json(force=True)
-    username = (data.get("username") or "").strip().lower()
+    username = _normalize_username(data.get("username"))
     password = data.get("password") or ""
     logging.debug(f"/api/register payload username={username}, password_len={len(password)}")
     if not username or not password:
@@ -259,7 +287,7 @@ def register():
 def login():
     logging.debug("Login endpoint called")
     data = request.get_json(force=True)
-    username = (data.get("username") or "").strip().lower()
+    username = _normalize_username(data.get("username"))
     password = data.get("password") or ""
     logging.debug(f"/api/login payload username={username}, password_len={len(password)}")
     if not username or not password:
@@ -278,6 +306,125 @@ def login():
     token = create_token(row["id"], username)
     logging.debug(f"Login success: user_id={row['id']}")
     return jsonify({"token": token, "username": username})
+
+# ==== Password reset via OTP ====
+@app.route("/api/password/forgot", methods=["POST"])
+def password_forgot():
+    """
+    Accepts: { "username": "name" }
+    Generates an OTP, stores a hashed copy with expiry, returns {status, otp} (otp included for demo).
+    """
+    logging.debug("/api/password/forgot called")
+    data = request.get_json(force=True)
+    username = _normalize_username(data.get("username"))
+    if not username:
+        logging.debug("password_forgot: missing username")
+        return jsonify({"error": "username_required"}), 400
+
+    db = get_db()
+    user = db.execute("SELECT id FROM users WHERE username = ?", (username,)).fetchone()
+    if not user:
+        # Do not reveal existence; still return OK
+        logging.debug("password_forgot: user not found (returning generic ok)")
+        return jsonify({"status": "ok"}), 200
+
+    user_id = int(user["id"])
+
+    # Invalidate any previous unused OTPs for this user (optional)
+    db.execute("UPDATE reset_otps SET consumed=1 WHERE user_id=? AND consumed=0", (user_id,))
+
+    # Generate new OTP
+    otp = _generate_otp()
+    code_hash = _otp_hash(otp)
+    expires_at = (datetime.utcnow() + timedelta(seconds=OTP_TTL_SECONDS)).isoformat() + "Z"
+
+    db.execute(
+        "INSERT INTO reset_otps (user_id, code_hash, expires_at, consumed, attempts_left) VALUES (?, ?, ?, 0, 5)",
+        (user_id, code_hash, expires_at),
+    )
+    db.commit()
+    logging.debug(f"password_forgot: OTP created for user_id={user_id}, expires_at={expires_at}")
+
+    # In real life you'd send the OTP via email/SMS. For this demo we return it.
+    return jsonify({"status": "ok", "otp": otp, "expires_at": expires_at})
+
+@app.route("/api/password/reset", methods=["POST"])
+def password_reset():
+    """
+    Accepts: { "username": "name", "otp": "123456", "new_password": "..." }
+    Validates OTP and sets new password. Returns {status, token, username} on success.
+    """
+    logging.debug("/api/password/reset called")
+    data = request.get_json(force=True)
+    username = _normalize_username(data.get("username"))
+    otp = (data.get("otp") or "").strip()
+    new_password = data.get("new_password") or ""
+
+    if not username or not otp or not new_password:
+        logging.debug("password_reset: missing field(s)")
+        return jsonify({"error": "username_otp_newpassword_required"}), 400
+
+    if not re.fullmatch(r"\d{6}", otp):
+        logging.debug("password_reset: bad otp format")
+        return jsonify({"error": "invalid_otp_format"}), 400
+
+    if len(new_password) < 6:
+        logging.debug("password_reset: weak password")
+        return jsonify({"error": "password_too_short"}), 400
+
+    db = get_db()
+    user = db.execute("SELECT id FROM users WHERE username = ?", (username,)).fetchone()
+    if not user:
+        # Do not reveal existence
+        logging.debug("password_reset: user not found (generic error)")
+        return jsonify({"error": "invalid_otp"}), 400
+
+    user_id = int(user["id"])
+    row = db.execute(
+        "SELECT id, code_hash, expires_at, consumed, attempts_left FROM reset_otps "
+        "WHERE user_id=? AND consumed=0 ORDER BY id DESC LIMIT 1",
+        (user_id,),
+    ).fetchone()
+
+    if not row:
+        logging.debug("password_reset: no active OTP")
+        return jsonify({"error": "no_active_otp"}), 400
+
+    otp_id = int(row["id"])
+    attempts_left = int(row["attempts_left"])
+    if attempts_left <= 0:
+        db.execute("UPDATE reset_otps SET consumed=1 WHERE id=?", (otp_id,))
+        db.commit()
+        logging.debug("password_reset: attempts exhausted")
+        return jsonify({"error": "otp_locked"}), 400
+
+    # Check expiry
+    try:
+        exp = datetime.fromisoformat(row["expires_at"].replace("Z", "+00:00"))
+    except Exception:
+        exp = datetime.utcnow() - timedelta(seconds=1)
+    if datetime.utcnow() > exp:
+        db.execute("UPDATE reset_otps SET consumed=1 WHERE id=?", (otp_id,))
+        db.commit()
+        logging.debug("password_reset: otp expired")
+        return jsonify({"error": "otp_expired"}), 400
+
+    # Check code
+    provided_hash = _otp_hash(otp)
+    if not hmac.compare_digest(provided_hash, row["code_hash"]):
+        db.execute("UPDATE reset_otps SET attempts_left=attempts_left-1 WHERE id=?", (otp_id,))
+        db.commit()
+        logging.debug("password_reset: otp mismatch")
+        return jsonify({"error": "invalid_otp", "attempts_left": attempts_left - 1}), 400
+
+    # All good: set new password and consume OTP
+    db.execute("UPDATE users SET password_hash=? WHERE id=?", (_hash_password(new_password), user_id))
+    db.execute("UPDATE reset_otps SET consumed=1 WHERE id=?", (otp_id,))
+    db.commit()
+    logging.debug(f"password_reset: password updated for user_id={user_id}")
+
+    token = create_token(user_id, username)
+    return jsonify({"status": "ok", "token": token, "username": username})
 
 # ==== Profile, Weights, Runs, Summary ====
 @app.route("/api/me", methods=["GET"])
